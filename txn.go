@@ -166,6 +166,15 @@ func (tr *transactionRunner) RunTransaction(ops []txn.Op) error {
 			logger.Infof("transaction 'before' hook end")
 		}
 	}
+	return tr.runInTokuTransaction(ops)
+}
+
+func (tr *transactionRunner) runInMgoTransaction(ops) error {
+	runner := tr.newRunner()
+	return runner.Run(ops, "", nil)
+}
+
+func (tr *transactionRunner) runInTokuTransaction(ops) error {
 	runner := tr.newRunner()
 	var status = &bson.M{}
 	if err := tr.db.Run("beginTransaction", status); err != nil {
