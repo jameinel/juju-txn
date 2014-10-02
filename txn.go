@@ -17,6 +17,7 @@ import (
 
 	"github.com/juju/loggo"
 	"gopkg.in/mgo.v2"
+	"gopkg.in/mgo.v2/bson"
 	"gopkg.in/mgo.v2/txn"
 )
 
@@ -166,7 +167,30 @@ func (tr *transactionRunner) RunTransaction(ops []txn.Op) error {
 		}
 	}
 	runner := tr.newRunner()
-	return runner.Run(ops, "", nil)
+	var status = &bson.M{}
+	if err := tr.db.Run("beginTransaction", status); err != nil {
+		logger.Errorf("failed to begin transaction: %v %v", err, *status)
+		return err
+	} else {
+		logger.Tracef("started transaction: %v", *status)
+	}
+	if runnerErr := runner.Run(ops, "", nil); runnerErr == nil {
+		if err := tr.db.Run("commitTransaction", status); err != nil {
+			logger.Errorf("failed to commit Transaction: %v %v", err, *status)
+			return err
+		} else {
+			logger.Tracef("committed transaction: %v", *status)
+		}
+		return nil
+	} else {
+		if err := tr.db.Run("rollbackTransaction", status); err != nil {
+			// We only log this error because we already have an error
+			logger.Errorf("failed to rollback Transaction: %v %v", err, *status)
+		} else {
+			logger.Tracef("rollback transaction due to %v: %v", runnerErr, *status)
+		}
+		return runnerErr
+	}
 }
 
 // ResumeTransactions is defined on Runner.
