@@ -14,6 +14,7 @@ package txn
 
 import (
 	stderrors "errors"
+	"strings"
 
 	"github.com/juju/loggo"
 	"gopkg.in/mgo.v2"
@@ -169,12 +170,14 @@ func (tr *transactionRunner) RunTransaction(ops []txn.Op) error {
 	return tr.runInTokuTransaction(ops)
 }
 
-func (tr *transactionRunner) runInMgoTransaction(ops) error {
+func (tr *transactionRunner) runInMgoTransaction(ops []txn.Op) error {
 	runner := tr.newRunner()
 	return runner.Run(ops, "", nil)
 }
 
-func (tr *transactionRunner) runInTokuTransaction(ops) error {
+const multiKeyErr = "Cannot transition from not multi key to multi key in multi statement transaction"
+
+func (tr *transactionRunner) runInTokuTransaction(ops []txn.Op) error {
 	runner := tr.newRunner()
 	var status = &bson.M{}
 	if err := tr.db.Run("beginTransaction", status); err != nil {
@@ -196,7 +199,14 @@ func (tr *transactionRunner) runInTokuTransaction(ops) error {
 			// We only log this error because we already have an error
 			logger.Errorf("failed to rollback Transaction: %v %v", err, *status)
 		} else {
-			logger.Tracef("rollback transaction due to %v: %v", runnerErr, *status)
+			if strings.Contains(runnerErr.Error(), multiKeyErr) {
+				// TODO: Make this more visible while testing
+				logger.Warningf("trying outside of transaction because of: %v %v: ops: %v",
+					runnerErr, *status, ops)
+				return tr.runInMgoTransaction(ops)
+			} else {
+				logger.Tracef("rollback transaction due to %v: %v", runnerErr, *status)
+			}
 		}
 		return runnerErr
 	}
