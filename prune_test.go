@@ -4,11 +4,16 @@
 package txn_test
 
 import (
+	"fmt"
+	"os"
+	"runtime/pprof"
+	"sync/atomic"
 	"time"
 
 	"github.com/juju/loggo"
 	jc "github.com/juju/testing/checkers"
 	gc "gopkg.in/check.v1"
+	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
 	"gopkg.in/mgo.v2/txn"
 
@@ -542,4 +547,162 @@ func (s *PruneSuite) assertPruneStatCount(c *gc.C, expected int) {
 
 func assertTimeIsRecent(c *gc.C, t time.Time) {
 	c.Assert(time.Now().Sub(t), jc.LessThan, time.Hour)
+}
+
+func backup(c *gc.C, txns, txnsCopy, coll, collCopy *mgo.Collection) {
+	err := txns.Pipe([]bson.M{{"$out": txnsCopy.Name}}).All(&bson.D{})
+	c.Assert(err, jc.ErrorIsNil)
+	err = coll.Pipe([]bson.M{{"$out": collCopy.Name}}).All(&bson.D{})
+	c.Assert(err, jc.ErrorIsNil)
+}
+
+func restore(c *gc.C, txns, txnsCopy, coll, collCopy *mgo.Collection) {
+	err := txnsCopy.Pipe([]bson.M{{"$out": txns.Name}}).All(&bson.D{})
+	c.Assert(err, jc.ErrorIsNil)
+	err = collCopy.Pipe([]bson.M{{"$out": coll.Name}}).All(&bson.D{})
+	c.Assert(err, jc.ErrorIsNil)
+}
+
+func (s *PruneSuite) TestResume(c *gc.C) {
+	tStart := time.Now()
+	// Create the doc first
+	s.runTxn(c, txn.Op{
+		C:      "coll",
+		Id:     1,
+		Insert: bson.M{},
+	})
+	txnsCopy := s.db.C("txnsCopy")
+	coll := s.db.C("coll")
+	collCopy := s.db.C("collCopy")
+	backup(c, s.txns, txnsCopy, coll, collCopy)
+
+	updateOp := txn.Op{
+		C:      "coll",
+		Id:     1,
+		Update: bson.M{},
+	}
+	totalSetup := time.Since(tStart)
+	count := 0
+	for _, N := range []int{10, 20, 40, 80, 100, 200, 400, 800} {
+		t := time.Now()
+		restore(c, s.txns, txnsCopy, coll, collCopy)
+		// grab a copy of the work we've done so far
+		// now break actually applying any txn
+		txn.SetChaos(txn.Chaos{
+			KillChance: 1,
+			Breakpoint: "set-applying",
+		})
+		subT := time.Now()
+		for ; count < N; count++ {
+			s.runFailingTxn(c, txn.ErrChaos, updateOp)
+		}
+		tAdd := time.Since(subT)
+		txn.SetChaos(txn.Chaos{})
+		// snapshot the work so far so we don't have to take the time
+		// to rebuild it
+		backup(c, s.txns, txnsCopy, coll, collCopy)
+		totalSetup += time.Since(t)
+		t = time.Now()
+		init := atomic.LoadUint64(&txn.TokenIdCounter)
+		err := s.runner.ResumeAll()
+		c.Assert(err, jc.ErrorIsNil)
+		final := atomic.LoadUint64(&txn.TokenIdCounter)
+		tResumed := time.Since(t)
+		c.Check(true, jc.IsFalse, gc.Commentf("N: %5d, %10.3f, %10.3f, %10.3f, %10d",
+			N, totalSetup.Seconds(), tAdd.Seconds(), tResumed.Seconds(), final-init))
+	}
+}
+
+func (s *PruneSuite) TestResume800(c *gc.C) {
+	tStart := time.Now()
+	// Create the doc first
+	s.runTxn(c, txn.Op{
+		C:      "coll",
+		Id:     1,
+		Insert: bson.M{},
+	})
+	// Now break the doc with a bad txn
+	txnId := bson.NewObjectId()
+	token := txnId.Hex() + "_deadbeef"
+	c.Logf("created bad txn: %q", token)
+	err := s.db.C("coll").Update(
+		bson.M{"_id": 1},
+		bson.M{"$set": bson.M{"txn-queue": []string{token}}},
+	)
+	c.Assert(err, jc.ErrorIsNil)
+	updateOp := txn.Op{
+		C:      "coll",
+		Id:     1,
+		Update: bson.M{},
+	}
+	totalSetup := time.Since(tStart)
+	count := 0
+	N := 800
+	t := time.Now()
+	// Applying transactions is currently broken
+	errString := fmt.Sprintf("cannot find transaction ObjectIdHex(%q)", txnId.Hex())
+	for ; count < N; count++ {
+		txnId := bson.NewObjectId()
+		err := s.runner.Run([]txn.Op{updateOp}, txnId, nil)
+		c.Assert(err.Error(), gc.Equals, errString)
+	}
+	// Remove the bad token and continue
+	err = s.db.C("coll").Update(
+		bson.M{"_id": 1},
+		bson.M{"$pull": bson.M{"txn-queue": []string{token}}},
+	)
+	c.Assert(err, jc.ErrorIsNil)
+	// snapshot the work so far so we don't have to take the time
+	// to rebuild it
+	totalSetup += time.Since(t)
+	t = time.Now()
+	out, err := os.Create("resume.pprof")
+	c.Assert(err, jc.ErrorIsNil)
+	defer out.Close()
+	pprof.StartCPUProfile(out)
+	init := atomic.LoadUint64(&txn.TokenIdCounter)
+	err = s.runner.ResumeAll()
+	// c.Assert(err, jc.ErrorIsNil)
+	final := atomic.LoadUint64(&txn.TokenIdCounter)
+	pprof.StopCPUProfile()
+	tResumed := time.Since(t)
+	c.Check(true, jc.IsFalse, gc.Commentf("N: %5d, %10.3f, %10.3f, %10d, %10d",
+		N, totalSetup.Seconds(), tResumed.Seconds(), final, final-init))
+}
+
+type arrayDoc struct {
+	A []string `bson:"a,omitempty"`
+}
+
+func (s *PruneSuite) TestAddToSet(c *gc.C) {
+	coll := s.db.C("coll")
+	docId := bson.NewObjectId()
+	err := coll.Insert(bson.M{"_id": docId, "a": []string{}})
+	c.Assert(err, jc.ErrorIsNil)
+	N := 1000
+	objIds := make([]string, N)
+	for i := 0; i < N; i++ {
+		objIds[i] = bson.NewObjectId().Hex()
+	}
+	i := 0
+	tTotal := time.Duration(0)
+	for _, N = range []int{10, 20, 40, 80, 100, 200, 400, 800, 1000} {
+		tStart := time.Now()
+		for ; i < N; i++ {
+			change := mgo.Change{
+				Update:    bson.D{{"$addToSet", bson.D{{"a", objIds[i]}}}},
+				ReturnNew: true,
+			}
+			cquery := coll.FindId(docId).Select(bson.D{{"a", 1}})
+			// Not sure where this would be allocated, in flusher it is allocated 1x per txn, but reused between documents
+			doc := arrayDoc{}
+			_, err := cquery.Apply(change, &doc)
+			c.Assert(err, jc.ErrorIsNil)
+			c.Check(doc.A, gc.HasLen, i+1)
+		}
+		tDelta := time.Since(tStart)
+		tTotal += tDelta
+		c.Check(true, jc.IsFalse, gc.Commentf("N: %5d, %10.3f, %10.3f",
+			N, tTotal.Seconds(), tDelta.Seconds()))
+	}
 }
