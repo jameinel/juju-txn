@@ -4,7 +4,6 @@
 package txn_test
 
 import (
-	"fmt"
 	"os"
 	"runtime/pprof"
 	"sync/atomic"
@@ -583,14 +582,14 @@ func (s *PruneSuite) TestResume(c *gc.C) {
 	}
 	totalSetup := time.Since(tStart)
 	count := 0
-	for _, N := range []int{10, 20, 40, 80, 100, 200, 400, 800} {
+	for _, N := range []int{10, 20, 40, 80, 100, 200, 400, 800, 1000, 2000, 4000} {
 		t := time.Now()
 		restore(c, s.txns, txnsCopy, coll, collCopy)
 		// grab a copy of the work we've done so far
 		// now break actually applying any txn
 		txn.SetChaos(txn.Chaos{
 			KillChance: 1,
-			Breakpoint: "set-applying",
+			Breakpoint: "set-prepared",
 		})
 		subT := time.Now()
 		for ; count < N; count++ {
@@ -613,7 +612,7 @@ func (s *PruneSuite) TestResume(c *gc.C) {
 	}
 }
 
-func (s *PruneSuite) TestResume800(c *gc.C) {
+func (s *PruneSuite) TestResume2000(c *gc.C) {
 	tStart := time.Now()
 	// Create the doc first
 	s.runTxn(c, txn.Op{
@@ -621,15 +620,6 @@ func (s *PruneSuite) TestResume800(c *gc.C) {
 		Id:     1,
 		Insert: bson.M{},
 	})
-	// Now break the doc with a bad txn
-	txnId := bson.NewObjectId()
-	token := txnId.Hex() + "_deadbeef"
-	c.Logf("created bad txn: %q", token)
-	err := s.db.C("coll").Update(
-		bson.M{"_id": 1},
-		bson.M{"$set": bson.M{"txn-queue": []string{token}}},
-	)
-	c.Assert(err, jc.ErrorIsNil)
 	updateOp := txn.Op{
 		C:      "coll",
 		Id:     1,
@@ -637,37 +627,34 @@ func (s *PruneSuite) TestResume800(c *gc.C) {
 	}
 	totalSetup := time.Since(tStart)
 	count := 0
-	N := 800
+	N := 2000
 	t := time.Now()
-	// Applying transactions is currently broken
-	errString := fmt.Sprintf("cannot find transaction ObjectIdHex(%q)", txnId.Hex())
+	// grab a copy of the work we've done so far
+	// now break actually applying any txn
+	txn.SetChaos(txn.Chaos{
+		KillChance: 1,
+		Breakpoint: "set-prepared",
+	})
 	for ; count < N; count++ {
-		txnId := bson.NewObjectId()
-		err := s.runner.Run([]txn.Op{updateOp}, txnId, nil)
-		c.Assert(err.Error(), gc.Equals, errString)
+		s.runFailingTxn(c, txn.ErrChaos, updateOp)
 	}
-	// Remove the bad token and continue
-	err = s.db.C("coll").Update(
-		bson.M{"_id": 1},
-		bson.M{"$pull": bson.M{"txn-queue": []string{token}}},
-	)
-	c.Assert(err, jc.ErrorIsNil)
+	txn.SetChaos(txn.Chaos{})
 	// snapshot the work so far so we don't have to take the time
 	// to rebuild it
 	totalSetup += time.Since(t)
-	t = time.Now()
 	out, err := os.Create("resume.pprof")
 	c.Assert(err, jc.ErrorIsNil)
 	defer out.Close()
 	pprof.StartCPUProfile(out)
+	t = time.Now()
 	init := atomic.LoadUint64(&txn.TokenIdCounter)
 	err = s.runner.ResumeAll()
-	// c.Assert(err, jc.ErrorIsNil)
+	c.Assert(err, jc.ErrorIsNil)
 	final := atomic.LoadUint64(&txn.TokenIdCounter)
-	pprof.StopCPUProfile()
 	tResumed := time.Since(t)
-	c.Check(true, jc.IsFalse, gc.Commentf("N: %5d, %10.3f, %10.3f, %10d, %10d",
-		N, totalSetup.Seconds(), tResumed.Seconds(), final, final-init))
+	pprof.StopCPUProfile()
+	c.Check(true, jc.IsFalse, gc.Commentf("N: %5d, %10.3f, %10.3f, %10d",
+		N, totalSetup.Seconds(), tResumed.Seconds(), final-init))
 }
 
 type arrayDoc struct {
