@@ -582,14 +582,14 @@ func (s *PruneSuite) TestResume(c *gc.C) {
 	}
 	totalSetup := time.Since(tStart)
 	count := 0
-	for _, N := range []int{10, 20, 40, 80, 100, 200, 400, 800, 1000, 2000, 4000} {
+	for _, N := range []int{10, 20, 40, 80, 100, 200, 400, 800} {//, 1000, 2000, 4000} {
 		t := time.Now()
 		restore(c, s.txns, txnsCopy, coll, collCopy)
 		// grab a copy of the work we've done so far
 		// now break actually applying any txn
 		txn.SetChaos(txn.Chaos{
 			KillChance: 1,
-			Breakpoint: "set-prepared",
+			Breakpoint: "set-applying",
 		})
 		subT := time.Now()
 		for ; count < N; count++ {
@@ -613,6 +613,7 @@ func (s *PruneSuite) TestResume(c *gc.C) {
 }
 
 func (s *PruneSuite) TestResume2000(c *gc.C) {
+	txn.SetDebug(false)
 	tStart := time.Now()
 	// Create the doc first
 	s.runTxn(c, txn.Op{
@@ -648,13 +649,66 @@ func (s *PruneSuite) TestResume2000(c *gc.C) {
 	pprof.StartCPUProfile(out)
 	t = time.Now()
 	init := atomic.LoadUint64(&txn.TokenIdCounter)
+	initPR := atomic.LoadUint64(&txn.PreloadedCount)
 	err = s.runner.ResumeAll()
 	c.Assert(err, jc.ErrorIsNil)
 	final := atomic.LoadUint64(&txn.TokenIdCounter)
+	finalPR := atomic.LoadUint64(&txn.PreloadedCount)
 	tResumed := time.Since(t)
 	pprof.StopCPUProfile()
-	c.Check(true, jc.IsFalse, gc.Commentf("N: %5d, %10.3f, %10.3f, %10d",
-		N, totalSetup.Seconds(), tResumed.Seconds(), final-init))
+	c.Check(true, jc.IsFalse, gc.Commentf("N: %5d, %10.3f, %10.3f, %10d, all Preload:%10d ResumePR:%10d",
+		N, totalSetup.Seconds(), tResumed.Seconds(), final-init, finalPR, finalPR-initPR ))
+}
+
+func (s *PruneSuite) TestResumeFromBroken(c *gc.C) {
+	txn.SetDebug(false)
+	tStart := time.Now()
+	// Create the doc first
+	s.runTxn(c, txn.Op{
+		C:      "coll",
+		Id:     1,
+		Insert: bson.M{},
+	})
+	badTxnToken := "123456789012345678901234_deadbeef"
+	s.db.C("coll").UpdateId(1, bson.M{"$set": bson.M{"txn-queue": []string{badTxnToken}}})
+	updateOps := []txn.Op{{
+		C:      "coll",
+		Id:     1,
+		Update: bson.M{"$set": bson.M{"key": "val"}},
+	}}
+	totalSetup := time.Since(tStart)
+	count := 0
+	N := 1000
+	t := time.Now()
+	// grab a copy of the work we've done so far
+	// now break actually applying any txn
+	// txn.SetChaos(txn.Chaos{
+	// 	KillChance: 1,
+	// 	Breakpoint: "set-applying",
+	// })
+	for ; count < N; count++ {
+		err := s.runner.Run(updateOps, "", nil)
+		c.Assert(err.Error(), gc.Equals, `cannot find transaction ObjectIdHex("123456789012345678901234")`)
+	}
+	s.db.C("coll").UpdateId(1, bson.M{"$pullAll": bson.M{"txn-queue": []string{badTxnToken}}})
+	// snapshot the work so far so we don't have to take the time
+	// to rebuild it
+	totalSetup += time.Since(t)
+	// out, err := os.Create("resume.pprof")
+	// c.Assert(err, jc.ErrorIsNil)
+	// defer out.Close()
+	// pprof.StartCPUProfile(out)
+	t = time.Now()
+	init := atomic.LoadUint64(&txn.TokenIdCounter)
+	initPR := atomic.LoadUint64(&txn.PreloadedCount)
+	err := s.runner.ResumeAll()
+	c.Assert(err, jc.ErrorIsNil)
+	final := atomic.LoadUint64(&txn.TokenIdCounter)
+	finalPR := atomic.LoadUint64(&txn.PreloadedCount)
+	tResumed := time.Since(t)
+	// pprof.StopCPUProfile()
+	c.Check(true, jc.IsFalse, gc.Commentf("N: %5d, %10.3f, %10.3f, %10d, all Preload:%10d ResumePR:%10d",
+		N, totalSetup.Seconds(), tResumed.Seconds(), final-init, finalPR, finalPR-initPR ))
 }
 
 type arrayDoc struct {
