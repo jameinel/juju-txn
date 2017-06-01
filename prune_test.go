@@ -700,15 +700,15 @@ func (s *PruneSuite) TestResumeFromBroken(c *gc.C) {
 	// pprof.StartCPUProfile(out)
 	t = time.Now()
 	init := atomic.LoadUint64(&txn.TokenIdCounter)
-	initPR := atomic.LoadUint64(&txn.PreloadedCount)
+	initPL := atomic.LoadUint64(&txn.PreloadedCount)
 	err := s.runner.ResumeAll()
 	c.Assert(err, jc.ErrorIsNil)
 	final := atomic.LoadUint64(&txn.TokenIdCounter)
-	finalPR := atomic.LoadUint64(&txn.PreloadedCount)
+	finalPL := atomic.LoadUint64(&txn.PreloadedCount)
 	tResumed := time.Since(t)
 	// pprof.StopCPUProfile()
-	c.Check(true, jc.IsFalse, gc.Commentf("N: %5d, %10.3f, %10.3f, %10d, all Preload:%10d ResumePR:%10d",
-		N, totalSetup.Seconds(), tResumed.Seconds(), final-init, finalPR, finalPR-initPR ))
+	c.Check(true, jc.IsFalse, gc.Commentf("N: %5d, %10.3f, %10.3f, %10d, all Preload:%10d ResumePL:%10d",
+		N, totalSetup.Seconds(), tResumed.Seconds(), final-init, finalPL, finalPL-initPL ))
 }
 
 type arrayDoc struct {
